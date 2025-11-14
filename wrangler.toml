@@ -9,8 +9,6 @@ kv_namespaces = [
 
 [vars]
 ADMIN_TOKEN = "your_admin_token_here"
-ALLOWED_DOMAINS = ""
-REQUEST_TIMEOUT_MS = "10000"
 
 # Cron: 每 15 分钟执行一次
 [[triggers.crons]]
