@@ -1,187 +1,276 @@
 /**
- * Cloudflare Worker: 定时访问服务（KV + Cron + 管理接口）
+ * Cloudflare Worker - KeepAlive 管理后台（HTML 控制台 + KV + Cron）
+ *
+ * UI Features:
+ *   - 查看所有 URL 状态
+ *   - 添加 URL
+ *   - 删除 URL
+ *   - 强制立即访问
  *
  * API:
- *   POST /add-url      添加 URL
- *   GET  /list         查看所有 URL
- *   POST /visit-now    立即访问
+ *   GET  /api/list
+ *   POST /api/add
+ *   POST /api/delete
+ *   POST /api/visit-now
  *
- * 环境变量:
- *   ADMIN_TOKEN        管理密码（必须设置）
- *   ALLOWED_DOMAINS    逗号分隔的域名白名单，可选
- *   REQUEST_TIMEOUT_MS 单次访问超时，默认 10000
- *
- * KV:
- *   URLS_KV            存储 URL 信息
+ * Web UI:
+ *   GET /
  */
 
 const DEFAULT_TIMEOUT = 10000;
 const CONCURRENCY = 6;
 
-// ----------- 工具函数 -----------
-
-async function hashKey(text) {
+// ------------ Helper ------------
+async function sha1(text) {
   const buf = await crypto.subtle.digest("SHA-1", new TextEncoder().encode(text));
-  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
-}
-
-function parseAuth(request) {
-  const h = request.headers.get("authorization") || "";
-  if (h.startsWith("Bearer ")) return h.substring(7);
-  return new URL(request.url).searchParams.get("token") || "";
+  return [...new Uint8Array(buf)].map(x => x.toString(16).padStart(2, "0")).join("");
 }
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data, null, 2), {
     status,
-    headers: { "Content-Type": "application/json" }
+    headers: { "Content-Type": "application/json" },
   });
 }
 
+function parseAuth(req) {
+  const h = req.headers.get("authorization") || "";
+  if (h.startsWith("Bearer ")) return h.substring(7);
+  return new URL(req.url).searchParams.get("token") || "";
+}
+
 function isValidUrl(url) {
-  try {
-    new URL(url);
-    return true;
-  } catch {
-    return false;
-  }
+  try { new URL(url); return true; }
+  catch { return false; }
 }
 
 async function timedFetch(url, timeoutMs) {
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), timeoutMs);
-
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const resp = await fetch(url, { signal: ctrl.signal, redirect: "follow" });
-    const txt = await resp.text().catch(() => "");
-    return { ok: resp.ok, status: resp.status, snippet: txt.slice(0, 120) };
+    const resp = await fetch(url, { method: "GET", signal: controller.signal });
+    const text = await resp.text().catch(() => "");
+    return { ok: resp.ok, status: resp.status, snippet: text.slice(0, 150) };
   } catch (err) {
     return { ok: false, error: err.message };
   } finally {
-    clearTimeout(t);
+    clearTimeout(timeout);
   }
 }
 
-// ----------- KV 操作 -----------
+// ------------ KV Operations ------------
+async function getAll(env) {
+  let cursor;
+  const items = [];
+  do {
+    const res = await env.URLS_KV.list({ cursor });
+    cursor = res.cursor;
+    for (const { name } of res.keys) {
+      const v = await env.URLS_KV.get(name);
+      if (v) items.push({ key: name, ...JSON.parse(v) });
+    }
+  } while (cursor);
+  return items;
+}
 
-async function putUrl(env, url) {
-  const key = await hashKey(url);
+async function addUrl(env, url) {
+  const key = await sha1(url);
   const record = {
     url,
     addedAt: new Date().toISOString(),
     lastVisited: null,
     lastStatus: null,
     successCount: 0,
-    failCount: 0
+    failCount: 0,
   };
-
   await env.URLS_KV.put(key, JSON.stringify(record));
   return { key, record };
 }
 
-async function listUrls(env) {
-  let cursor = undefined;
-  const list = [];
-
-  do {
-    const r = await env.URLS_KV.list({ cursor });
-    cursor = r.cursor;
-
-    for (const k of r.keys) {
-      const val = await env.URLS_KV.get(k.name);
-      if (val) {
-        list.push({ key: k.name, ...JSON.parse(val) });
-      }
-    }
-  } while (cursor);
-
-  return list;
+async function deleteUrl(env, key) {
+  await env.URLS_KV.delete(key);
 }
 
-// ----------- API 处理 -----------
+// ------------ HTML UI ------------
+function renderHtml() {
+  return new Response(
+    `
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>KeepAlive 控制台</title>
+<style>
+body { font-family: sans-serif; padding: 20px; background: #111; color: #eee; }
+h1 { color: #4fd1c5; }
+input, button { padding: 8px; margin: 5px; }
+table { width: 100%; margin-top: 20px; border-collapse: collapse; }
+td, th { padding: 8px; border-bottom: 1px solid #333; }
+button { cursor: pointer; }
+</style>
+</head>
+<body>
+<h1>KeepAlive 控制台</h1>
 
-async function handleAddUrl(req, env) {
+<div>
+  <h3>添加 URL</h3>
+  <input id="url-input" placeholder="https://example.com" size="50"/>
+  <input id="token-input" placeholder="Admin Token" size="30"/>
+  <button onclick="addUrl()">添加</button>
+</div>
+
+<h3>URL 列表</h3>
+<table id="list">
+  <tr><th>URL</th><th>最后访问</th><th>状态</th><th>成功/失败</th><th>操作</th></tr>
+</table>
+
+<script>
+async function loadList() {
+  const token = document.getElementById("token-input").value;
+  const res = await fetch("/api/list", {
+    headers: { Authorization: "Bearer " + token }
+  });
+  const data = await res.json();
+
+  const tbl = document.getElementById("list");
+  tbl.innerHTML = '<tr><th>URL</th><th>最后访问</th><th>状态</th><th>成功/失败</th><th>操作</th></tr>';
+
+  data.items.forEach(item => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = \`
+      <td>\${item.url}</td>
+      <td>\${item.lastVisited || "-"}</td>
+      <td>\${item.lastStatus || "-"}</td>
+      <td>\${item.successCount}/\${item.failCount}</td>
+      <td>
+        <button onclick="visitNow('\${item.url}')">访问</button>
+        <button onclick="delUrl('\${item.key}')">删除</button>
+      </td>
+    \`;
+    tbl.appendChild(tr);
+  });
+}
+
+async function addUrl() {
+  const url = document.getElementById("url-input").value;
+  const token = document.getElementById("token-input").value;
+
+  await fetch("/api/add", {
+    method: "POST",
+    headers: {
+      "Authorization": "Bearer " + token,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ url })
+  });
+  loadList();
+}
+
+async function delUrl(key) {
+  const token = document.getElementById("token-input").value;
+  await fetch("/api/delete", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer " + token,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ key })
+  });
+  loadList();
+}
+
+async function visitNow(url) {
+  const token = document.getElementById("token-input").value;
+  await fetch("/api/visit-now", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer " + token,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ url })
+  });
+  alert("访问完成");
+}
+
+loadList();
+</script>
+</body>
+</html>
+`,
+    { headers: { "Content-Type": "text/html" } },
+  );
+}
+
+// ------------ API Handlers ------------
+async function handleAPI(req, env) {
+  const url = new URL(req.url);
+  const path = url.pathname;
   const token = parseAuth(req);
-  if (token !== env.ADMIN_TOKEN) return json({ error: "Unauthorized" }, 401);
 
-  const body = await req.json().catch(() => null);
-  if (!body || !body.url) return json({ error: "missing url" }, 400);
+  if (token !== env.ADMIN_TOKEN)
+    return json({ error: "Unauthorized" }, 401);
 
-  const url = body.url.trim();
-  if (!isValidUrl(url)) return json({ error: "invalid url" }, 400);
+  if (path === "/api/list")
+    return json({ items: await getAll(env) });
 
-  const allowed = (env.ALLOWED_DOMAINS || "").split(",").map(s => s.trim()).filter(Boolean);
-  const host = new URL(url).hostname.toLowerCase();
-
-  if (allowed.length && !allowed.includes(host)) {
-    return json({ error: "domain not allowed", host }, 403);
+  if (path === "/api/add") {
+    const body = await req.json();
+    if (!body.url || !isValidUrl(body.url)) return json({ error: "invalid url" }, 400);
+    return json(await addUrl(env, body.url));
   }
 
-  const r = await putUrl(env, url);
-  return json({ ok: true, added: r });
+  if (path === "/api/delete") {
+    const body = await req.json();
+    await deleteUrl(env, body.key);
+    return json({ ok: true });
+  }
+
+  if (path === "/api/visit-now") {
+    const body = await req.json();
+    return json(await timedFetch(body.url, DEFAULT_TIMEOUT));
+  }
+
+  return json({ error: "Unknown API path" }, 404);
 }
 
-async function handleList(req, env) {
-  const token = parseAuth(req);
-  if (token !== env.ADMIN_TOKEN) return json({ error: "Unauthorized" }, 401);
-  const res = await listUrls(env);
-  return json({ count: res.length, items: res });
-}
-
-async function handleVisitNow(req, env) {
-  const token = parseAuth(req);
-  if (token !== env.ADMIN_TOKEN) return json({ error: "Unauthorized" }, 401);
-
-  const body = await req.json().catch(() => null);
-  if (!body?.url) return json({ error: "missing url" }, 400);
-
-  const result = await timedFetch(body.url, parseInt(env.REQUEST_TIMEOUT_MS || DEFAULT_TIMEOUT));
-  return json({ url: body.url, result });
-}
-
-// ----------- Cron 定时调度 -----------
-
-async function scheduledHandler(env) {
-  const items = await listUrls(env);
-  if (!items.length) return;
-
-  const timeout = parseInt(env.REQUEST_TIMEOUT_MS || DEFAULT_TIMEOUT);
-  let index = 0;
+// ------------ Cron Job ------------
+async function cronRun(env) {
+  const items = await getAll(env);
+  const timeout = DEFAULT_TIMEOUT;
+  let i = 0;
 
   async function worker() {
-    while (index < items.length) {
-      const p = items[index++];
-      const r = await timedFetch(p.url, timeout);
+    while (i < items.length) {
+      const idx = i++;
+      const item = items[idx];
+      const result = await timedFetch(item.url, timeout);
 
-      const rec = {
-        ...p,
+      const updated = {
+        ...item,
         lastVisited: new Date().toISOString(),
-        lastStatus: r.ok ? r.status : r.error,
-        successCount: p.successCount + (r.ok ? 1 : 0),
-        failCount: p.failCount + (r.ok ? 0 : 1)
+        lastStatus: result.ok ? result.status : result.error,
+        successCount: item.successCount + (result.ok ? 1 : 0),
+        failCount: item.failCount + (result.ok ? 0 : 1)
       };
 
-      await env.URLS_KV.put(p.key, JSON.stringify(rec));
+      await env.URLS_KV.put(item.key, JSON.stringify(updated));
     }
   }
 
   await Promise.all(new Array(Math.min(CONCURRENCY, items.length)).fill(0).map(worker));
 }
 
-// ----------- Worker 主体 -----------
-
+// ------------ Worker Entry ------------
 export default {
   async fetch(req, env) {
-    const path = new URL(req.url).pathname;
-
-    if (req.method === "POST" && path === "/add-url") return handleAddUrl(req, env);
-    if (req.method === "GET" && path === "/list") return handleList(req, env);
-    if (req.method === "POST" && path === "/visit-now") return handleVisitNow(req, env);
-
-    return new Response("KeepAlive Worker running.", { status: 200 });
+    const url = new URL(req.url);
+    if (url.pathname.startsWith("/api/")) {
+      return handleAPI(req, env);
+    }
+    return renderHtml();
   },
 
-  async scheduled(event, env, ctx) {
-    await scheduledHandler(env);
-  }
+  async scheduled(event, env) {
+    await cronRun(env);
+  },
 };
